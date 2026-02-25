@@ -1,12 +1,7 @@
-[2026-02-25T20:29:54Z] PCAP: dhcp.pcapng
-DHCP/BOOTP events: 4
-
-Message type counts:
-  Discover: 2
-  Offer: 2
-
-Saved files:
-  dhcp_events.csv
-  dhcp_type_stats.png
-  dhcp_activity.png
-  triage_log.txt
+[2026-02-25T22:32:46Z] PCAP: dhcp.pcapng
+DHCP packets: 4
+Counts:
+  Discover: 1
+  Offer: 1
+  Request: 1
+  ACK: 1
