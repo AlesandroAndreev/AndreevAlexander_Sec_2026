@@ -1,108 +1,144 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
+import json
+import math
 from pathlib import Path
-from datetime import datetime, timezone
-import asyncio
-
 import pandas as pd
 import matplotlib.pyplot as plt
-import pyshark
 
-DHCP_TYPE_MAP = {"1": "Discover", "2": "Offer", "3": "Request", "5": "ACK", "6": "NAK"}
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def pick_pcap(folder: Path) -> Path:
-    files = sorted(folder.glob("*.pcapng")) + sorted(folder.glob("*.pcap"))
-    if not files:
-        raise FileNotFoundError("Нет .pcapng/.pcap рядом со скриптом.")
-    return files[0]
+SCRIPT_DIR = Path(__file__).resolve().parent  # папка, где лежит .py
+JSON_PATH = SCRIPT_DIR / "botsv1.json"
+OUT_WIN = SCRIPT_DIR / "wineventlog_top10.png"
+OUT_DNS = SCRIPT_DIR / "dns_top10.png"
+OUT_COMBINED = SCRIPT_DIR / "combined_top10.png"
 
 
-def to_epoch(iso_ts: str) -> float:
-    s = str(iso_ts).strip().replace("Z", "+00:00")
-    if "." in s and "+" in s:
-        head, rest = s.split(".", 1)
-        frac, tz = rest.split("+", 1)
-        frac = (frac[:6]).ljust(6, "0")
-        s = f"{head}.{frac}+{tz}"
-    dt = datetime.fromisoformat(s)
-    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+# ---------- helpers ----------
+def shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    s = s.lower()
+    probs = [s.count(ch) / len(s) for ch in set(s)]
+    return -sum(p * math.log2(p) for p in probs)
 
 
-def handshake_type(pkt) -> str:
-    code = str(pkt.dhcp.option.type_tree[0].dhcp)  # DHCP Option 53
-    return DHCP_TYPE_MAP.get(code, code)
+def base_domain(qname: str) -> str:
+    # Упрощённо: последние 2 метки (под .com/.net/.org и т.п. ок).
+    parts = [p for p in str(qname).strip(".").split(".") if p]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else str(qname)
+
+# ---------- load ----------
+
+data = json.loads(JSON_PATH.read_text(encoding="utf-8"))
+
+df = pd.json_normalize(data, sep=".")
+df.columns = [c.replace(" ", "_") for c in df.columns]
 
 
-def extract_dhcp(pcap: Path) -> pd.DataFrame:
-    loop = asyncio.new_event_loop()
-    cap = pyshark.FileCapture(str(pcap), display_filter="dhcp", keep_packets=False, use_json=True, eventloop=loop)
-
-    rows = []
-    for pkt in cap:
-        dhcp = pkt.dhcp
-        rows.append({
-            "ts": to_epoch(pkt.sniff_timestamp),
-            "handshake": handshake_type(pkt),
-            "xid": dhcp.id,
-            "client_mac": dhcp.mac_addr,
-            "client_ip": dhcp.ip.client,
-            "your_ip": dhcp.ip.your,
-            "server_ip": dhcp.ip.server,
-        })
-
-    cap.close()
-    loop.close()
-    return pd.DataFrame(rows)
+# ---------- split ----------
+# В этом датасете DNS события обычно имеют result.LogName == "DNS"
+df_dns = df[df.get("result.LogName") == "DNS"].copy()
+df_win = df[(df.get("result.LogName").notna()) & (df.get("result.LogName") != "DNS")].copy()
 
 
-def main() -> None:
-    folder = Path(__file__).resolve().parent
-    pcap = pick_pcap(folder)
+# ---------- WinEventLog: suspicious top-10 ----------
+# Минимальный список "подозрительных" ID (можешь расширять)
+SUSPICIOUS_EVENT_IDS = {
+    4625,  # failed logon
+    4688,  # process creation
+    4689,  # process termination
+    4697,  # service installed (Security)
+    4698,  # scheduled task created
+    4702,  # scheduled task updated
+    4703,  # token right adjusted
+    4719,  # audit policy changed
+    4720, 4722, 4724, 4740,  # account created/enabled/reset/locked
+    4728, 4732, 4756,        # added to privileged groups
+    1102,  # audit log cleared
+    7045,  # service installed (System)
+}
 
-    df = extract_dhcp(pcap)
-    df.to_csv(folder / "dhcp_events.csv", index=False)
+df_win["event_id"] = pd.to_numeric(df_win.get("result.EventCode"), errors="coerce")
+df_win["is_suspicious"] = df_win["event_id"].isin(SUSPICIOUS_EVENT_IDS)
 
-    # Bar: распределение Discover/Offer/Request/ACK
-    stats = df["handshake"].value_counts()
-    plt.figure()
-    plt.bar(stats.index.astype(str), stats.values)
-    plt.yticks(range(0, 2, 1))
-    plt.xlabel("DHCP handshake type (Option 53)")
-    plt.ylabel("Count")
-    plt.title("DHCP DORA distribution")
-    plt.tight_layout()
-    plt.savefig(folder / "dhcp_type_stats.png", dpi=200)
-    plt.close()
+win_counts = (
+    df_win[df_win["is_suspicious"]]
+    .groupby("event_id")
+    .size()
+    .sort_values(ascending=False)
+)
 
-    # Raw: 4 точки (по пакетам)
-    plt.figure()
-    t_rel = (df["ts"] - df["ts"].min()) * 1000
-    plt.scatter(t_rel, range(len(df)))
-    plt.xlim(-5, max(100, float(t_rel.max()) + 10))
-    plt.xlabel("Time (ms from first packet)")
-    plt.ylabel("Packet index")
-    plt.title("Raw DHCP packets (DORA)")
-    plt.tight_layout()
-    plt.savefig(folder / "dhcp_activity.png", dpi=200)
-    plt.close()
+win_top10 = win_counts.head(10)
 
-    # Log
-    lines = [
-        f"[{utc_now()}] PCAP: {pcap.name}",
-        f"DHCP packets: {len(df)}",
-        "Counts:",
-        *[f"  {k}: {v}" for k, v in stats.to_dict().items()],
+# ---------- DNS: suspicious top-10 (heuristic score) ----------
+# Эвристика: энтропия/длина лейбла/буквы+цифры/паттерн c2|malicious
+
+df_dns["qname"] = df_dns.get("result.QueryName").astype(str)
+df_dns["base_domain"] = df_dns["qname"].apply(base_domain)
+df_dns["leftmost_label"] = df_dns["qname"].str.split(".").str[0].fillna("")
+df_dns["entropy"] = df_dns["leftmost_label"].apply(shannon_entropy)
+df_dns["len_label"] = df_dns["leftmost_label"].str.len().fillna(0)
+
+df_dns["has_digits_and_letters"] = (
+    df_dns["leftmost_label"].str.contains(r"[a-zA-Z]", regex=True)
+    & df_dns["leftmost_label"].str.contains(r"\d", regex=True)
+)
+df_dns["looks_c2"] = (
+    df_dns["qname"].str.contains(r"(^|\.)c2(\.|$)", regex=True)
+    | df_dns["qname"].str.contains("malicious", case=False, regex=False)
+)
+
+df_dns["dns_score"] = (
+    (df_dns["entropy"] > 3.2).astype(int) * 2
+    + (df_dns["len_label"] >= 12).astype(int)
+    + df_dns["has_digits_and_letters"].astype(int)
+    + df_dns["looks_c2"].astype(int) * 3
+)
+
+dns_scores = df_dns.groupby("qname")["dns_score"].sum().sort_values(ascending=False)
+
+# Если все score == 0, fallback на частоту запросов
+if dns_scores.max() == 0:
+    dns_scores = df_dns.groupby("qname").size().sort_values(ascending=False).astype(int)
+
+# Для графика — показывать только >0 (если есть)
+dns_scores_plot = dns_scores.copy()
+if (dns_scores_plot > 0).any():
+    dns_scores_plot = dns_scores_plot[dns_scores_plot > 0]
+
+dns_top10 = dns_scores_plot.head(10)
+
+
+# ---------- plot 1: WinEventLog ----------
+plt.figure(figsize=(10, 5))
+win_top10.sort_values(ascending=True).plot(kind="barh")
+plt.title("WinEventLog: Top подозрительных EventID (по количеству)")
+plt.xlabel("Количество событий")
+plt.ylabel("EventID")
+plt.tight_layout()
+plt.savefig(OUT_WIN, dpi=200)
+
+
+# ---------- plot 2: DNS ----------
+plt.figure(figsize=(10, 5))
+dns_top10.sort_values(ascending=True).plot(kind="barh")
+plt.title("DNS: Top подозрительных запросов (по эвристическому score)")
+plt.xlabel("Score")
+plt.ylabel("QueryName")
+plt.tight_layout()
+plt.savefig(OUT_DNS, dpi=200)
+
+
+# ---------- plot 3: combined ----------
+combined = pd.concat(
+    [
+        win_top10.rename(lambda x: f"WinEventID {int(x)}" if pd.notna(x) else "WinEventID ?"),
+        dns_top10.rename(lambda x: f"DNS {x}"),
     ]
-    (folder / "triage_log.txt").write_text("\n".join(lines), encoding="utf-8")
+).sort_values(ascending=False).head(10)
 
-    print("OK")
-
-
-if __name__ == "__main__":
-    main()
+plt.figure(figsize=(10, 5))
+combined.sort_values(ascending=True).plot(kind="barh")
+plt.title("Объединённая визуализация: топ индикаторов (Win counts + DNS score)")
+plt.xlabel("Значение (Win=кол-во, DNS=score)")
+plt.ylabel("Индикатор")
+plt.tight_layout()
+plt.savefig(OUT_COMBINED, dpi=200)
